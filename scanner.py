@@ -86,62 +86,47 @@ async def _get_json(
 
 # ── Market discovery via Gamma API ────────────────────────────────────────────
 
-async def _search_gamma(
-    session: aiohttp.ClientSession,
-    keyword: str,
-) -> list[MarketDict]:
+async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Search the Gamma API for active markets matching *keyword*.
-    Returns a list of market dicts (may be empty on failure).
+    Fetch active crypto markets from the Gamma API using tag filtering,
+    then apply client-side keyword matching.
+
+    Why tag_slug=crypto instead of q=keyword:
+      The Gamma API q= parameter does fuzzy/semantic search and returns
+      unrelated markets (e.g. searching "Bitcoin Up or Down" returns Trump
+      deportation markets). Using tag_slug=crypto gets all crypto markets
+      reliably, and we filter by title text client-side.
     """
+    log_info("Fetching crypto markets from Gamma API (tag_slug=crypto)…")
     data = await _get_json(
         session,
         f"{GAMMA_API_URL}/markets",
         params={
-            "q": keyword,
-            "active": "true",
-            "closed": "false",
-            "limit": "20",
+            "tag_slug": "crypto",
+            "active":   "true",
+            "closed":   "false",
+            "limit":    "100",
         },
     )
+
     if data is None:
         return []
 
-    # Gamma API returns a plain list, not {"data": [...]}
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("data", [])
-    return []
+    raw: list[MarketDict] = data if isinstance(data, list) else data.get("data", [])
+    log_info(f"Gamma API returned {len(raw)} crypto markets (before keyword filter).")
 
+    # Debug: show first 5 raw titles so we can verify tag filter worked
+    for m in raw[:5]:
+        log_info(f"  RAW | {m.get('question','?')[:80]}")
 
-async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
-    """
-    Fetch all live Up/Down crypto markets from the Gamma API.
-
-    Searches for each keyword in MARKET_KEYWORDS concurrently and deduplicates
-    results by condition_id.  Typical result: 8-16 markets (one per active
-    5-min/15-min window for BTC, ETH, SOL, XRP).
-    """
-    log_info(f"Searching Gamma API for {len(config.MARKET_KEYWORDS)} keyword(s)…")
-
-    # Fan out one search per keyword, gather results concurrently
-    result_lists = await asyncio.gather(
-        *(_search_gamma(session, kw) for kw in config.MARKET_KEYWORDS)
-    )
-
-    # Deduplicate by conditionId (Gamma) / condition_id (CLOB)
-    seen: set[str] = set()
-    markets: list[MarketDict] = []
-    for batch in result_lists:
-        for m in batch:
-            cid = m.get("conditionId") or m.get("condition_id") or m.get("id") or ""
-            if cid and cid not in seen:
-                seen.add(cid)
-                markets.append(m)
-
-    log_info(f"Gamma API returned {len(markets)} unique markets.")
-    return markets
+    # Client-side keyword filter — exact substring match on question title
+    matched = [
+        m for m in raw
+        if any(kw.lower() in (m.get("question") or "").lower()
+               for kw in config.MARKET_KEYWORDS)
+    ]
+    log_info(f"After keyword filter: {len(matched)} Up/Down markets.")
+    return matched
 
 
 # ── Market normalisation ──────────────────────────────────────────────────────
@@ -227,6 +212,8 @@ async def _fetch_best_ask(
 
     Returns None if the book is empty or the request fails.
     """
+    # Debug: log the token_id being queried (first 20 chars)
+    log_info(f"    /book query token_id={token_id[:20]}…")
     data = await _get_json(
         session,
         f"{config.POLYMARKET_API_URL}/book",
