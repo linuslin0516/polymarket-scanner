@@ -226,6 +226,12 @@ def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
     for m in result:
         liq = float(m.get("liquidity") or 0)
         log_info(f"  WATCH | ${liq:,.0f} | {m.get('question','?')}")
+        # Debug: show raw clobTokenIds and normalised token IDs for first market only
+        if result and m is result[0]:
+            raw_ids = m.get("clobTokenIds") or []
+            log_info(f"  DEBUG clobTokenIds raw  : {raw_ids}")
+            for tok in m.get("tokens", []):
+                log_info(f"  DEBUG token_id ({tok.get('outcome','?')}): {tok.get('token_id','?')}")
     log_info("--- End market list ---")
     return result
 
@@ -250,6 +256,7 @@ async def _fetch_best_ask(
 
     Returns None if the book is empty or the request fails.
     """
+    log_info(f"  /book token_id={token_id}")
     data = await _get_json(
         session,
         f"{config.POLYMARKET_API_URL}/book",
