@@ -65,20 +65,22 @@ async def _get_json(
 
 async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Retrieve ALL active markets from the Polymarket CLOB API.
+    Retrieve active markets from the Polymarket CLOB API.
 
-    The /markets endpoint is cursor-paginated.  The standard first-page
-    cursor is "LTE=" and the API signals end-of-data by returning "LTE="
-    again as next_cursor.  We also cap at MAX_PAGES as a safety valve.
+    Key design decisions:
+    - active=true  filters out expired/resolved markets server-side,
+      cutting the result set from 28,000+ down to ~200-500
+    - Sequential pagination (no concurrent fetches) keeps ordering clean
+    - MAX_PAGES = 10 is a safety cap; active markets fit in far fewer pages
     """
-    MAX_PAGES = 50  # 50 × 100 = 5 000 markets maximum
+    MAX_PAGES = 10
     markets: list[MarketDict] = []
     cursor: str | None = None  # None = first page, no cursor param needed
     page = 0
 
     while page < MAX_PAGES:
-        # First page: no cursor param. Subsequent pages: pass the cursor.
-        params: dict[str, str] = {}
+        # Always filter for active markets — avoids pulling 28k+ historical entries
+        params: dict[str, str] = {"active": "true"}
         if cursor:
             params["next_cursor"] = cursor
 
@@ -87,22 +89,20 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
         if data is None:
             break  # network failure already logged
 
-        # API returns {"data": [...], "next_cursor": "...", "limit": 100}
         batch: list[MarketDict] = data.get("data", [])
         markets.extend(batch)
         page += 1
 
         next_cursor: str = data.get("next_cursor", "") or ""
-
         log_info(f"  → got {len(batch)} markets (total so far: {len(markets)}), next_cursor={next_cursor[:16]!r}")
 
-        # "LTE=" signals end-of-data. Empty string also means done.
+        # Empty string or "LTE=" = end of data
         if not next_cursor or next_cursor == "LTE=" or len(batch) == 0:
             break
 
         cursor = next_cursor
 
-    log_info(f"Fetched {len(markets)} total markets across {page} page(s).")
+    log_info(f"Fetched {len(markets)} active markets across {page} page(s).")
     return markets
 
 
