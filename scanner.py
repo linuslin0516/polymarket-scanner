@@ -14,7 +14,7 @@ happen is marked with:  # TODO: place_order() here
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -108,20 +108,33 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
 
 # ── Market filtering ──────────────────────────────────────────────────────────
 
+def _is_future_market(market: MarketDict) -> bool:
+    """
+    Return True if the market's end date is in the future (i.e. not yet resolved).
+    The API's active=true param doesn't reliably filter old markets, so we
+    check end_date_iso ourselves.  Markets with no end date are kept.
+    """
+    end_date_str: str = market.get("end_date_iso") or market.get("end_date") or ""
+    if not end_date_str:
+        return True  # no date info — keep it
+    try:
+        # Handle both "2026-02-25T00:00:00Z" and "2026-02-25T00:00:00+00:00"
+        end_date_str = end_date_str.replace("Z", "+00:00")
+        end_dt = datetime.fromisoformat(end_date_str)
+        return end_dt > datetime.now(timezone.utc)
+    except ValueError:
+        return True  # unparseable — keep it
+
+
 def _matches_keywords(market: MarketDict) -> bool:
     """
-    Return True if this market's question/title contains:
-      - at least one ASSET keyword  (BTC, ETH, Bitcoin, Ethereum)
-      - at least one TIMEFRAME keyword  (5 min, 15 min, …)
-
-    Case-insensitive.
+    Return True if the market title contains at least one ASSET keyword.
+    Timeframe keywords are intentionally removed here so we can first
+    discover what crypto markets actually exist on Polymarket, then
+    re-add timeframe filtering once we know the real title format.
     """
     title: str = (market.get("question") or market.get("description") or "").lower()
-
-    has_asset = any(kw.lower() in title for kw in config.ASSET_KEYWORDS)
-    has_timeframe = any(kw.lower() in title for kw in config.TIMEFRAME_KEYWORDS)
-
-    return has_asset and has_timeframe
+    return any(kw.lower() in title for kw in config.ASSET_KEYWORDS)
 
 
 def _has_sufficient_liquidity(market: MarketDict) -> bool:
@@ -137,20 +150,27 @@ def _has_sufficient_liquidity(market: MarketDict) -> bool:
 
 
 def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
-    """Apply keyword and liquidity filters; return the qualifying subset."""
-    # Debug: print a sample of raw market titles so we can tune keywords
-    log_info(f"--- Sample of first 20 active market titles (for keyword tuning) ---")
-    for m in markets[:20]:
-        title = m.get("question") or m.get("description") or "(no title)"
-        log_info(f"  SAMPLE | {title}")
-    log_info(f"--- End sample ---")
+    """Apply date, keyword, and liquidity filters; return the qualifying subset."""
+    # Step 1: only future/active markets (replaces broken active=true API param)
+    future = [m for m in markets if _is_future_market(m)]
+    log_info(f"After date filter: {len(future)} markets still open (from {len(markets)} total)")
 
+    # Step 2: asset keyword match (BTC / ETH etc.)
     filtered = [
-        m for m in markets
-        if m.get("active", False)
-        and _matches_keywords(m)
+        m for m in future
+        if _matches_keywords(m)
         and _has_sufficient_liquidity(m)
     ]
+
+    # Debug: print ALL matching crypto market titles so we can see what exists
+    log_info(f"--- Found {len(filtered)} crypto markets (showing all titles) ---")
+    for m in filtered:
+        title = m.get("question") or m.get("description") or "(no title)"
+        end  = m.get("end_date_iso") or m.get("end_date") or "?"
+        liq  = m.get("liquidity") or 0
+        log_info(f"  CRYPTO | [{end[:10]}] ${float(liq):,.0f} | {title}")
+    log_info(f"--- End crypto market list ---")
+
     log_info(f"Filtered to {len(filtered)} relevant markets.")
     return filtered
 
