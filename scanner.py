@@ -166,6 +166,14 @@ def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
     future = [m for m in markets if _is_future_market(m)]
     log_info(f"After date filter: {len(future)} markets still open (from {len(markets)} total)")
 
+    # Debug: dump every field of one market so we can see the actual data shape
+    if future:
+        sample = future[0]
+        log_info("=== FULL RAW MARKET OBJECT (first future market) ===")
+        for k, v in sample.items():
+            log_info(f"  {k}: {str(v)[:120]}")
+        log_info("=== END RAW MARKET OBJECT ===")
+
     # Step 2: asset keyword match (BTC / ETH etc.)
     filtered = [
         m for m in future
