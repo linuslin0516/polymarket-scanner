@@ -1,0 +1,14 @@
+# Environment variables — never commit secrets
+.env
+
+# Generated output
+opportunities.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
