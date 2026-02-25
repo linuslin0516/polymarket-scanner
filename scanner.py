@@ -26,6 +26,7 @@ is marked with:  # TODO: place_order() here
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -194,12 +195,18 @@ def _normalise_market(market: MarketDict) -> MarketDict:
     if not market.get("end_date_iso") and market.get("endDate"):
         market["end_date_iso"] = market["endDate"]
 
-    # tokens — Gamma may provide clobTokenIds + outcomes as parallel arrays
+    # tokens — Gamma may provide clobTokenIds + outcomes as parallel arrays.
+    # The Gamma API returns these fields as JSON-encoded strings, not Python
+    # lists, so parse them with json.loads() when needed.
     if not market.get("tokens") or not any(
         t.get("token_id") for t in market.get("tokens", [])
     ):
-        clob_ids: list[str] = market.get("clobTokenIds") or []
-        outcomes: list[str] = market.get("outcomes") or ["Up", "Down"]
+        raw_ids = market.get("clobTokenIds") or []
+        clob_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else list(raw_ids)
+
+        raw_outcomes = market.get("outcomes") or ["Up", "Down"]
+        outcomes: list[str] = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else list(raw_outcomes)
+
         if len(clob_ids) >= 2:
             market["tokens"] = [
                 {"token_id": clob_ids[0], "outcome": outcomes[0]},
@@ -226,12 +233,6 @@ def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
     for m in result:
         liq = float(m.get("liquidity") or 0)
         log_info(f"  WATCH | ${liq:,.0f} | {m.get('question','?')}")
-        # Debug: show raw clobTokenIds and normalised token IDs for first market only
-        if result and m is result[0]:
-            raw_ids = m.get("clobTokenIds") or []
-            log_info(f"  DEBUG clobTokenIds raw  : {raw_ids}")
-            for tok in m.get("tokens", []):
-                log_info(f"  DEBUG token_id ({tok.get('outcome','?')}): {tok.get('token_id','?')}")
     log_info("--- End market list ---")
     return result
 
@@ -256,7 +257,6 @@ async def _fetch_best_ask(
 
     Returns None if the book is empty or the request fails.
     """
-    log_info(f"  /book token_id={token_id}")
     data = await _get_json(
         session,
         f"{config.POLYMARKET_API_URL}/book",
