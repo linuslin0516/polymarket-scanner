@@ -73,13 +73,16 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
     MAX_PAGES = 50  # 50 × 100 = 5 000 markets maximum
     markets: list[MarketDict] = []
-    cursor: str = "LTE="  # Polymarket's conventional start cursor
+    cursor: str | None = None  # None = first page, no cursor param needed
     page = 0
 
     while page < MAX_PAGES:
-        params: dict[str, str] = {"next_cursor": cursor}
+        # First page: no cursor param. Subsequent pages: pass the cursor.
+        params: dict[str, str] = {}
+        if cursor:
+            params["next_cursor"] = cursor
 
-        log_info(f"Fetching markets page {page + 1} (cursor={cursor[:12]}…)")
+        log_info(f"Fetching markets page {page + 1}" + (f" (cursor={cursor[:12]}…)" if cursor else " (first page)"))
         data = await _get_json(session, f"{config.POLYMARKET_API_URL}/markets", params=params)
         if data is None:
             break  # network failure already logged
@@ -93,8 +96,7 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
 
         log_info(f"  → got {len(batch)} markets (total so far: {len(markets)}), next_cursor={next_cursor[:16]!r}")
 
-        # "LTE=" returned again means we've wrapped back to the start = done
-        # An empty string also signals end of data
+        # "LTE=" signals end-of-data. Empty string also means done.
         if not next_cursor or next_cursor == "LTE=" or len(batch) == 0:
             break
 
