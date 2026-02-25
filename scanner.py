@@ -1,41 +1,25 @@
 """
-scanner.py - Core arbitrage detection logic (READ-ONLY).
+scanner.py - Market discovery logic (READ-ONLY).
 
-Flow per scan cycle:
-  1. Generate Gamma API slugs for current/upcoming 15-min and 5-min windows
-  2. Fetch each slug concurrently to discover active Up/Down markets
-  3. For each market, fetch the best ask for UP and DOWN tokens from CLOB /book
-  4. Compute total_cost = up_ask + down_ask
-  5. If total_cost < ARB_THRESHOLD emit an Opportunity via the logger
+Responsibilities:
+  - Generate Gamma API slugs for current/upcoming 15-min and 5-min windows
+  - Fetch each slug concurrently to discover active Up/Down markets
+  - Normalise Gamma API fields to a consistent shape for consumption by main.py
 
-Why slug-based discovery:
-  - The Gamma API's tag/search parameters don't reliably surface these markets.
-    tag_slug=crypto returns unrelated markets; q= is fuzzy/semantic.
-  - These markets have a deterministic slug format:
-      {crypto}-updown-{interval}-{unix_start_timestamp}
-    e.g.  btc-updown-15m-1740441600
-  - We compute the current and next N window start times, build the slugs, and
-    fetch them directly — no guessing, no filtering through 500 unrelated items.
-
-Why reload markets every cycle:
-  - 5-min and 15-min markets roll over continuously. Each new window is a
-    completely new market with new condition_id and token IDs.
-
+Price fetching and arb detection live in main.py (WebSocket-based).
 No order placement takes place here. Every spot where execution would happen
 is marked with:  # TODO: place_order() here
 """
 
 import asyncio
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta  # datetime used in _get_window_timestamps
 from typing import Any
 
 import aiohttp
 
 import config
 from logger import (
-    Opportunity,
-    log_opportunity,
     log_info,
     log_warning,
     log_error,
@@ -235,156 +219,6 @@ def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
         log_info(f"  WATCH | ${liq:,.0f} | {m.get('question','?')}")
     log_info("--- End market list ---")
     return result
-
-
-# ── Order-book price fetching ─────────────────────────────────────────────────
-
-async def _fetch_best_ask(
-    session: aiohttp.ClientSession,
-    token_id: str,
-) -> float | None:
-    """
-    Query the CLOB order book for *token_id* and return the best (lowest) ask.
-
-    Endpoint: GET /book?token_id=<token_id>
-    Response shape:
-      {
-        "market": "0x...",
-        "asset_id": "...",
-        "bids": [{"price": "0.53", "size": "100"}, ...],
-        "asks": [{"price": "0.48", "size": "200"}, ...]   ← sorted ascending
-      }
-
-    Returns None if the book is empty or the request fails.
-    """
-    data = await _get_json(
-        session,
-        f"{config.POLYMARKET_API_URL}/book",
-        params={"token_id": token_id},
-    )
-    if data is None:
-        return None
-
-    asks: list[dict] = data.get("asks", [])
-    if not asks:
-        return None
-
-    try:
-        return float(asks[0]["price"])
-    except (KeyError, ValueError, IndexError):
-        return None
-
-
-async def _fetch_token_prices(
-    session: aiohttp.ClientSession,
-    market: MarketDict,
-) -> tuple[float | None, float | None]:
-    """
-    Concurrently fetch the best ask for the UP (yes) and DOWN (no) tokens.
-
-    Handles both outcome label conventions:
-      - Classic binary:  "Yes" / "No"
-      - Up/Down markets: "Up"  / "Down"
-
-    Falls back to positional assignment (index 0 = yes/up, index 1 = no/down)
-    if no recognisable label is found.
-
-    Returns (up_ask, down_ask). Either value is None if unavailable.
-    """
-    tokens: list[dict] = market.get("tokens", [])
-    if len(tokens) < 2:
-        return None, None
-
-    up_id: str | None = None
-    down_id: str | None = None
-
-    for tok in tokens:
-        outcome = (tok.get("outcome") or "").lower()
-        if outcome in ("yes", "up"):
-            up_id = tok.get("token_id")
-        elif outcome in ("no", "down"):
-            down_id = tok.get("token_id")
-
-    # Positional fallback
-    if not up_id or not down_id:
-        up_id = tokens[0].get("token_id")
-        down_id = tokens[1].get("token_id")
-
-    if not up_id or not down_id:
-        return None, None
-
-    up_ask, down_ask = await asyncio.gather(
-        _fetch_best_ask(session, up_id),
-        _fetch_best_ask(session, down_id),
-    )
-    return up_ask, down_ask
-
-
-# ── Arbitrage detection ───────────────────────────────────────────────────────
-
-def _check_arb(
-    market: MarketDict,
-    up_ask: float,
-    down_ask: float,
-    timestamp: str,
-) -> Opportunity | None:
-    """
-    In a fair binary market UP_ask + DOWN_ask ≈ 1.00.
-    If the sum is below ARB_THRESHOLD the buyer locks in a risk-free profit
-    equal to (1.00 - total_cost) per dollar deployed.
-
-    Returns an Opportunity dataclass if the condition is met, else None.
-    """
-    total_cost = up_ask + down_ask
-    if total_cost >= config.ARB_THRESHOLD:
-        return None
-
-    edge_pct = (1.0 - total_cost) * 100
-
-    return Opportunity(
-        timestamp=timestamp,
-        market_id=market.get("condition_id") or market.get("id") or "unknown",
-        market_title=market.get("question") or "Unknown Market",
-        yes_ask=round(up_ask, 4),
-        no_ask=round(down_ask, 4),
-        total_cost=round(total_cost, 4),
-        edge_pct=round(edge_pct, 4),
-    )
-
-
-# ── Single scan cycle ─────────────────────────────────────────────────────────
-
-async def scan_once(
-    session: aiohttp.ClientSession,
-    markets: list[MarketDict],
-) -> list[Opportunity]:
-    """
-    Scan every market in *markets* for arbitrage in a single pass.
-    Fetches all order books concurrently for low latency.
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    opportunities: list[Opportunity] = []
-
-    async def _process(market: MarketDict) -> Opportunity | None:
-        title = market.get("question") or "?"
-        try:
-            up_ask, down_ask = await _fetch_token_prices(session, market)
-            if up_ask is None or down_ask is None:
-                return None
-            return _check_arb(market, up_ask, down_ask, timestamp)
-        except Exception as exc:
-            log_warning(f"Error processing '{title[:50]}': {exc}")
-            return None
-
-    results = await asyncio.gather(*(_process(m) for m in markets))
-
-    for result in results:
-        if result is not None:
-            log_opportunity(result)
-            opportunities.append(result)
-            # TODO: place_order() here — submit UP and DOWN legs to capture the edge
-
-    return opportunities
 
 
 # ── Market refresh ────────────────────────────────────────────────────────────
