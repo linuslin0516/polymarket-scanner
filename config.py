@@ -30,9 +30,22 @@ MIN_LIQUIDITY: float = float(os.getenv("MIN_LIQUIDITY", "500"))
 LOG_FILE: str = os.getenv("LOG_FILE", "opportunities.csv")
 
 # ── Market keyword filters ────────────────────────────────────────────────────
-# A market must match at least one asset keyword AND at least one timeframe keyword
-ASSET_KEYWORDS: list[str] = ["BTC", "ETH", "Bitcoin", "Ethereum"]
-TIMEFRAME_KEYWORDS: list[str] = ["5 min", "5-min", "15 min", "15-min", "5minute", "15minute"]
+# Actual Polymarket title format (confirmed):
+#   "Bitcoin Up or Down - February 24, 12:10AM-12:15AM ET"  (15-min)
+#   "Ethereum Up or Down - February 23, 3:15PM-3:30PM ET"   (15-min)
+#   "Bitcoin Up or Down - February 24, 12:05AM-12:10AM ET"  (5-min)
+# A market matches if its title contains ANY of these strings (case-insensitive).
+MARKET_KEYWORDS: list[str] = [
+    "Bitcoin Up or Down",
+    "Ethereum Up or Down",
+    "Solana Up or Down",
+    "XRP Up or Down",
+]
+
+# NOTE: 15-min and 5-min crypto markets on Polymarket charge taker fees
+# (market orders). Maker orders (limit orders) are free and earn rebates.
+# Always use LIMIT orders when executing to avoid fees eating the arb edge.
+# TODO: place_order() here — use limit orders only
 
 # ── Retry policy ─────────────────────────────────────────────────────────────
 MAX_RETRIES: int = 3

@@ -128,13 +128,13 @@ def _is_future_market(market: MarketDict) -> bool:
 
 def _matches_keywords(market: MarketDict) -> bool:
     """
-    Return True if the market title contains at least one ASSET keyword.
-    Timeframe keywords are intentionally removed here so we can first
-    discover what crypto markets actually exist on Polymarket, then
-    re-add timeframe filtering once we know the real title format.
+    Match against the confirmed Polymarket title format, e.g.:
+      "Bitcoin Up or Down - February 24, 12:10AM-12:15AM ET"
+      "Ethereum Up or Down - February 23, 3:15PM-3:30PM ET"
+    A market matches if its title contains ANY string in MARKET_KEYWORDS.
     """
     title: str = (market.get("question") or market.get("description") or "").lower()
-    return any(kw.lower() in title for kw in config.ASSET_KEYWORDS)
+    return any(kw.lower() in title for kw in config.MARKET_KEYWORDS)
 
 
 def _has_sufficient_liquidity(market: MarketDict) -> bool:
@@ -162,14 +162,14 @@ def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
         and _has_sufficient_liquidity(m)
     ]
 
-    # Debug: print ALL matching crypto market titles so we can see what exists
-    log_info(f"--- Found {len(filtered)} crypto markets (showing all titles) ---")
+    # On startup, log all matched markets so operator can verify filtering
+    log_info(f"--- Matched {len(filtered)} Up/Down crypto markets ---")
     for m in filtered:
         title = m.get("question") or m.get("description") or "(no title)"
-        end  = m.get("end_date_iso") or m.get("end_date") or "?"
-        liq  = m.get("liquidity") or 0
-        log_info(f"  CRYPTO | [{end[:10]}] ${float(liq):,.0f} | {title}")
-    log_info(f"--- End crypto market list ---")
+        end   = (m.get("end_date_iso") or m.get("end_date") or "?")[:16]
+        liq   = float(m.get("liquidity") or 0)
+        log_info(f"  WATCH | [{end}] ${liq:,.0f} | {title}")
+    log_info(f"--- End market list ---")
 
     log_info(f"Filtered to {len(filtered)} relevant markets.")
     return filtered
