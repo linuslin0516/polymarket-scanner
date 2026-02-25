@@ -88,24 +88,26 @@ async def _get_json(
 
 async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Fetch active crypto markets from the Gamma API using tag filtering,
-    then apply client-side keyword matching.
+    Fetch active markets from the Gamma API and filter by keyword client-side.
 
-    Why tag_slug=crypto instead of q=keyword:
-      The Gamma API q= parameter does fuzzy/semantic search and returns
-      unrelated markets (e.g. searching "Bitcoin Up or Down" returns Trump
-      deportation markets). Using tag_slug=crypto gets all crypto markets
-      reliably, and we filter by title text client-side.
+    Why no tag_slug:
+      tag_slug=crypto returns unrelated markets (Trump deportation, GTA 6 price,
+      etc.) — apparently that tag is broader than expected.  Fetching a large
+      batch of all active markets and matching by title text is more reliable.
+
+    Why limit=500:
+      The Up/Down 5-min and 15-min markets roll over every few minutes, so they
+      are always among the most recently active markets.  A batch of 500 active
+      markets ordered by default (recency) reliably includes all open windows.
     """
-    log_info("Fetching crypto markets from Gamma API (tag_slug=crypto)…")
+    log_info("Fetching active markets from Gamma API (no tag filter)…")
     data = await _get_json(
         session,
         f"{GAMMA_API_URL}/markets",
         params={
-            "tag_slug": "crypto",
-            "active":   "true",
-            "closed":   "false",
-            "limit":    "100",
+            "active": "true",
+            "closed": "false",
+            "limit":  "500",
         },
     )
 
@@ -113,9 +115,9 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
         return []
 
     raw: list[MarketDict] = data if isinstance(data, list) else data.get("data", [])
-    log_info(f"Gamma API returned {len(raw)} crypto markets (before keyword filter).")
+    log_info(f"Gamma API returned {len(raw)} active markets (before keyword filter).")
 
-    # Debug: show first 5 raw titles so we can verify tag filter worked
+    # Debug: show first 5 raw titles so we can verify ordering/content
     for m in raw[:5]:
         log_info(f"  RAW | {m.get('question','?')[:80]}")
 
