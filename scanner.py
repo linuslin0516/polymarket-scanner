@@ -67,32 +67,35 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
     Retrieve ALL active markets from the Polymarket CLOB API.
 
-    The /markets endpoint is paginated; we walk every page until the
-    'next_cursor' field is absent or empty.
-
-    Returns a flat list of market dicts (may be large – typically 100-500+).
+    The /markets endpoint is cursor-paginated.  The standard first-page
+    cursor is "LTE=" and the API signals end-of-data by returning "LTE="
+    again as next_cursor.  We also cap at MAX_PAGES as a safety valve.
     """
+    MAX_PAGES = 50  # 50 × 100 = 5 000 markets maximum
     markets: list[MarketDict] = []
-    cursor: str | None = None
+    cursor: str = "LTE="  # Polymarket's conventional start cursor
     page = 0
 
-    while True:
-        params: dict[str, str] = {}
-        if cursor:
-            params["next_cursor"] = cursor
+    while page < MAX_PAGES:
+        params: dict[str, str] = {"next_cursor": cursor}
 
+        log_info(f"Fetching markets page {page + 1} (cursor={cursor[:12]}…)")
         data = await _get_json(session, f"{config.POLYMARKET_API_URL}/markets", params=params)
         if data is None:
             break  # network failure already logged
 
-        # API returns {"data": [...], "next_cursor": "...", "limit": 100, ...}
+        # API returns {"data": [...], "next_cursor": "...", "limit": 100}
         batch: list[MarketDict] = data.get("data", [])
         markets.extend(batch)
         page += 1
 
-        next_cursor = data.get("next_cursor", "")
-        # An empty string or the sentinel "LTE=" signals the last page
-        if not next_cursor or next_cursor in ("LTE=", ""):
+        next_cursor: str = data.get("next_cursor", "") or ""
+
+        log_info(f"  → got {len(batch)} markets (total so far: {len(markets)}), next_cursor={next_cursor[:16]!r}")
+
+        # "LTE=" returned again means we've wrapped back to the start = done
+        # An empty string also signals end of data
+        if not next_cursor or next_cursor == "LTE=" or len(batch) == 0:
             break
 
         cursor = next_cursor
