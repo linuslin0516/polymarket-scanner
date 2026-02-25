@@ -2,19 +2,30 @@
 scanner.py - Core arbitrage detection logic (READ-ONLY).
 
 Flow per scan cycle:
-  1. Fetch all active markets from the Polymarket CLOB REST API
-  2. Filter for short-term BTC/ETH binary markets by keyword matching
-  3. For each filtered market, fetch the best YES and NO ask prices from
-     the order-book endpoint
-  4. Compute total_cost = yes_ask + no_ask
-  5. If total_cost < ARB_THRESHOLD emit an Opportunity via the logger
+  1. Query Polymarket Gamma API for live Up/Down crypto markets by keyword
+  2. For each market, fetch the best ask for the UP (yes) and DOWN (no) tokens
+     from the CLOB order-book endpoint
+  3. Compute total_cost = up_ask + down_ask
+  4. If total_cost < ARB_THRESHOLD emit an Opportunity via the logger
 
-No order placement takes place here.  Every spot where execution would
-happen is marked with:  # TODO: place_order() here
+Why Gamma API for discovery, CLOB API for prices:
+  - The CLOB /markets endpoint returns 35,000+ markets without useful filtering.
+    The 5-min/15-min crypto markets are buried somewhere in that list.
+  - The Gamma API (used by the Polymarket frontend) supports keyword search and
+    returns fully-populated market objects including token IDs.
+  - The CLOB /book endpoint is still the correct source for live order-book data.
+
+Why reload markets every cycle:
+  - 5-min and 15-min markets roll over continuously. Each new time window is a
+    completely new market with new condition_id and token IDs. Caching the list
+    at startup means we'd be querying stale/expired markets within minutes.
+
+No order placement takes place here. Every spot where execution would happen
+is marked with:  # TODO: place_order() here
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -31,11 +42,13 @@ from logger import (
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 
-# Raw dict returned by the CLOB /markets endpoint
 MarketDict = dict[str, Any]
 
+# Gamma API base URL (market discovery)
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
 
-# ── Polymarket CLOB REST helpers ──────────────────────────────────────────────
+
+# ── HTTP helper ───────────────────────────────────────────────────────────────
 
 async def _get_json(
     session: aiohttp.ClientSession,
@@ -49,12 +62,20 @@ async def _get_json(
     """
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                log_warning(f"HTTP {resp.status} from {url} (attempt {attempt}/{config.MAX_RETRIES})")
+                log_warning(
+                    f"HTTP {resp.status} from {url} "
+                    f"(attempt {attempt}/{config.MAX_RETRIES})"
+                )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            log_warning(f"Request error [{type(exc).__name__}] for {url} (attempt {attempt}/{config.MAX_RETRIES})")
+            log_warning(
+                f"Request error [{type(exc).__name__}] for {url} "
+                f"(attempt {attempt}/{config.MAX_RETRIES})"
+            )
 
         if attempt < config.MAX_RETRIES:
             await asyncio.sleep(config.RETRY_DELAY_SECONDS)
@@ -63,151 +84,127 @@ async def _get_json(
     return None
 
 
-import base64 as _base64
+# ── Market discovery via Gamma API ────────────────────────────────────────────
 
+async def _search_gamma(
+    session: aiohttp.ClientSession,
+    keyword: str,
+) -> list[MarketDict]:
+    """
+    Search the Gamma API for active markets matching *keyword*.
+    Returns a list of market dicts (may be empty on failure).
+    """
+    data = await _get_json(
+        session,
+        f"{GAMMA_API_URL}/markets",
+        params={
+            "q": keyword,
+            "active": "true",
+            "closed": "false",
+            "limit": "20",
+        },
+    )
+    if data is None:
+        return []
 
-def _offset_cursor(offset: int) -> str:
-    """Encode an integer offset as a Polymarket pagination cursor (base64)."""
-    return _base64.b64encode(str(offset).encode()).decode()
+    # Gamma API returns a plain list, not {"data": [...]}
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("data", [])
+    return []
 
 
 async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Retrieve the MOST RECENT markets from the Polymarket CLOB API.
+    Fetch all live Up/Down crypto markets from the Gamma API.
 
-    The API returns markets oldest-first.  The 5-min/15-min crypto markets
-    were launched recently and live near the END of the ~28,000-market list.
-    Fetching from offset 0 and capping at 10 pages misses them entirely.
-
-    Strategy: start at a high offset (e.g. 26,000) and page forward to the
-    end of the list, collecting only the newest markets.  We then apply a
-    date filter so only currently-open markets are passed to the scanner.
+    Searches for each keyword in MARKET_KEYWORDS concurrently and deduplicates
+    results by condition_id.  Typical result: 8-16 markets (one per active
+    5-min/15-min window for BTC, ETH, SOL, XRP).
     """
-    # Determined empirically: total market count is ~28,000.
-    # Start 3,000 from the end so we always catch the latest markets even
-    # as new ones are added daily.  Adjust START_OFFSET upward if needed.
-    START_OFFSET = 25_000
-    MAX_PAGES = 10   # 10 × 1,000 = up to 10,000 markets from that point
+    log_info(f"Searching Gamma API for {len(config.MARKET_KEYWORDS)} keyword(s)…")
 
+    # Fan out one search per keyword, gather results concurrently
+    result_lists = await asyncio.gather(
+        *(_search_gamma(session, kw) for kw in config.MARKET_KEYWORDS)
+    )
+
+    # Deduplicate by conditionId (Gamma) / condition_id (CLOB)
+    seen: set[str] = set()
     markets: list[MarketDict] = []
-    cursor: str = _offset_cursor(START_OFFSET)
-    page = 0
+    for batch in result_lists:
+        for m in batch:
+            cid = m.get("conditionId") or m.get("condition_id") or m.get("id") or ""
+            if cid and cid not in seen:
+                seen.add(cid)
+                markets.append(m)
 
-    while page < MAX_PAGES:
-        params: dict[str, str] = {"next_cursor": cursor}
-
-        log_info(f"Fetching markets page {page + 1} (offset ~{START_OFFSET + page * 1000})")
-        data = await _get_json(session, f"{config.POLYMARKET_API_URL}/markets", params=params)
-        if data is None:
-            break
-
-        batch: list[MarketDict] = data.get("data", [])
-        markets.extend(batch)
-        page += 1
-
-        next_cursor: str = data.get("next_cursor", "") or ""
-        log_info(f"  → got {len(batch)} markets (total so far: {len(markets)}), next_cursor={next_cursor[:16]!r}")
-
-        if not next_cursor or next_cursor == "LTE=" or len(batch) == 0:
-            break
-
-        cursor = next_cursor
-
-    log_info(f"Fetched {len(markets)} recent markets across {page} page(s).")
+    log_info(f"Gamma API returned {len(markets)} unique markets.")
     return markets
 
 
-# ── Market filtering ──────────────────────────────────────────────────────────
+# ── Market normalisation ──────────────────────────────────────────────────────
 
-def _is_future_market(market: MarketDict) -> bool:
+def _normalise_market(market: MarketDict) -> MarketDict:
     """
-    Return True if the market's end date is in the future (i.e. not yet resolved).
-    The API's active=true param doesn't reliably filter old markets, so we
-    check end_date_iso ourselves.  Markets with no end date are kept.
-    """
-    end_date_str: str = market.get("end_date_iso") or market.get("end_date") or ""
-    if not end_date_str:
-        return True  # no date info — keep it
-    try:
-        # Handle both "2026-02-25T00:00:00Z" and "2026-02-25T00:00:00+00:00"
-        end_date_str = end_date_str.replace("Z", "+00:00")
-        end_dt = datetime.fromisoformat(end_date_str)
-        return end_dt > datetime.now(timezone.utc)
-    except ValueError:
-        return True  # unparseable — keep it
+    The Gamma API uses camelCase field names (conditionId, endDate, clobTokenIds)
+    while the CLOB API uses snake_case (condition_id, end_date_iso, tokens).
+    Normalise to a consistent snake_case shape so the rest of the code works
+    with either source.
 
+    Token structure after normalisation:
+      tokens: [
+        {"token_id": "...", "outcome": "up"},
+        {"token_id": "...", "outcome": "down"},
+      ]
+    """
+    # condition_id
+    if not market.get("condition_id") and market.get("conditionId"):
+        market["condition_id"] = market["conditionId"]
 
-def _matches_keywords(market: MarketDict) -> bool:
-    """
-    Match against the confirmed Polymarket title format, e.g.:
-      "Bitcoin Up or Down - February 24, 12:10AM-12:15AM ET"
-      "Ethereum Up or Down - February 23, 3:15PM-3:30PM ET"
-    A market matches if its title contains ANY string in MARKET_KEYWORDS.
-    """
-    title: str = (market.get("question") or market.get("description") or "").lower()
-    return any(kw.lower() in title for kw in config.MARKET_KEYWORDS)
+    # question (Gamma uses "question" too, but fall back to "title")
+    if not market.get("question") and market.get("title"):
+        market["question"] = market["title"]
 
+    # end_date_iso
+    if not market.get("end_date_iso") and market.get("endDate"):
+        market["end_date_iso"] = market["endDate"]
 
-def _has_sufficient_liquidity(market: MarketDict) -> bool:
-    """
-    Return True if the market reports at least MIN_LIQUIDITY USD of liquidity.
-    Returns False (and silently skips) when the field is absent or zero.
-    """
-    try:
-        liquidity = float(market.get("liquidity") or 0)
-        return liquidity >= config.MIN_LIQUIDITY
-    except (TypeError, ValueError):
-        return False
+    # tokens — Gamma may provide clobTokenIds + outcomes as parallel arrays
+    if not market.get("tokens") or not any(
+        t.get("token_id") for t in market.get("tokens", [])
+    ):
+        clob_ids: list[str] = market.get("clobTokenIds") or []
+        outcomes: list[str] = market.get("outcomes") or ["Up", "Down"]
+        if len(clob_ids) >= 2:
+            market["tokens"] = [
+                {"token_id": clob_ids[0], "outcome": outcomes[0]},
+                {"token_id": clob_ids[1], "outcome": outcomes[1]},
+            ]
 
-
-def _is_tradeable(market: MarketDict) -> bool:
-    """
-    Return True only if the market is fully live:
-      - active flag is True
-      - accepting_orders is True
-      - both YES and NO tokens have non-empty token_id
-    The date filter kept 1,198 zombie markets with active=False and
-    empty token IDs; this guard removes them.
-    """
-    if not market.get("active"):
-        return False
-    if not market.get("accepting_orders"):
-        return False
-    tokens: list[dict] = market.get("tokens", [])
-    if len(tokens) < 2:
-        return False
-    return all(bool(t.get("token_id")) for t in tokens)
+    return market
 
 
 def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
-    """Apply active/tradeable, keyword, and liquidity filters."""
-    # Step 1: keep only fully live, tradeable markets
-    tradeable = [m for m in markets if _is_tradeable(m)]
-    log_info(f"Tradeable markets: {len(tradeable)} (from {len(markets)} fetched)")
+    """Normalise fields and keep only markets with valid token IDs."""
+    result: list[MarketDict] = []
+    for m in markets:
+        m = _normalise_market(m)
+        tokens: list[dict] = m.get("tokens", [])
+        if len(tokens) < 2 or not all(t.get("token_id") for t in tokens):
+            log_warning(
+                f"Skipping '{m.get('question','?')[:60]}' — missing token IDs"
+            )
+            continue
+        result.append(m)
 
-    # Debug: show a few tradeable market titles to verify we're in the right range
-    log_info("--- Sample of 5 tradeable market titles ---")
-    for m in tradeable[:5]:
-        log_info(f"  SAMPLE | {m.get('question', '?')[:100]}")
-    log_info("--- End sample ---")
-
-    # Step 2: keyword match + liquidity
-    filtered = [
-        m for m in tradeable
-        if _matches_keywords(m)
-        and _has_sufficient_liquidity(m)
-    ]
-
-    log_info(f"--- Matched {len(filtered)} Up/Down crypto markets ---")
-    for m in filtered:
-        title = m.get("question") or "(no title)"
-        end   = (m.get("end_date_iso") or "?")[:16]
-        liq   = float(m.get("liquidity") or 0)
-        log_info(f"  WATCH | [{end}] ${liq:,.0f} | {title}")
-    log_info(f"--- End market list ---")
-
-    log_info(f"Filtered to {len(filtered)} relevant markets.")
-    return filtered
+    log_info(f"--- Watching {len(result)} markets ---")
+    for m in result:
+        liq = float(m.get("liquidity") or 0)
+        log_info(f"  WATCH | ${liq:,.0f} | {m.get('question','?')}")
+    log_info("--- End market list ---")
+    return result
 
 
 # ── Order-book price fetching ─────────────────────────────────────────────────
@@ -230,17 +227,19 @@ async def _fetch_best_ask(
 
     Returns None if the book is empty or the request fails.
     """
-    url = f"{config.POLYMARKET_API_URL}/book"
-    data = await _get_json(session, url, params={"token_id": token_id})
+    data = await _get_json(
+        session,
+        f"{config.POLYMARKET_API_URL}/book",
+        params={"token_id": token_id},
+    )
     if data is None:
         return None
 
     asks: list[dict] = data.get("asks", [])
     if not asks:
-        return None  # no ask side — illiquid
+        return None
 
     try:
-        # asks are returned best-first (lowest price first for asks)
         return float(asks[0]["price"])
     except (KeyError, ValueError, IndexError):
         return None
@@ -251,68 +250,73 @@ async def _fetch_token_prices(
     market: MarketDict,
 ) -> tuple[float | None, float | None]:
     """
-    Concurrently fetch the best ask for the YES token and the NO token.
+    Concurrently fetch the best ask for the UP (yes) and DOWN (no) tokens.
 
-    Polymarket binary markets have exactly two outcome tokens stored in
-    market["tokens"] as [{"token_id": "...", "outcome": "Yes"}, {"token_id": "...", "outcome": "No"}]
+    Handles both outcome label conventions:
+      - Classic binary:  "Yes" / "No"
+      - Up/Down markets: "Up"  / "Down"
 
-    Returns (yes_ask, no_ask).  Either value is None if unavailable.
+    Falls back to positional assignment (index 0 = yes/up, index 1 = no/down)
+    if no recognisable label is found.
+
+    Returns (up_ask, down_ask). Either value is None if unavailable.
     """
     tokens: list[dict] = market.get("tokens", [])
     if len(tokens) < 2:
         return None, None
 
-    # Identify which token is YES and which is NO
-    yes_token_id: str | None = None
-    no_token_id: str | None = None
+    up_id: str | None = None
+    down_id: str | None = None
+
     for tok in tokens:
         outcome = (tok.get("outcome") or "").lower()
-        if outcome == "yes":
-            yes_token_id = tok.get("token_id")
-        elif outcome == "no":
-            no_token_id = tok.get("token_id")
+        if outcome in ("yes", "up"):
+            up_id = tok.get("token_id")
+        elif outcome in ("no", "down"):
+            down_id = tok.get("token_id")
 
-    if not yes_token_id or not no_token_id:
+    # Positional fallback
+    if not up_id or not down_id:
+        up_id = tokens[0].get("token_id")
+        down_id = tokens[1].get("token_id")
+
+    if not up_id or not down_id:
         return None, None
 
-    # Fetch both asks concurrently
-    yes_ask, no_ask = await asyncio.gather(
-        _fetch_best_ask(session, yes_token_id),
-        _fetch_best_ask(session, no_token_id),
+    up_ask, down_ask = await asyncio.gather(
+        _fetch_best_ask(session, up_id),
+        _fetch_best_ask(session, down_id),
     )
-    return yes_ask, no_ask
+    return up_ask, down_ask
 
 
 # ── Arbitrage detection ───────────────────────────────────────────────────────
 
 def _check_arb(
     market: MarketDict,
-    yes_ask: float,
-    no_ask: float,
+    up_ask: float,
+    down_ask: float,
     timestamp: str,
 ) -> Opportunity | None:
     """
-    Check whether this market presents an arbitrage opportunity.
-
-    In a fair binary market YES_ask + NO_ask ≈ 1.00.
-    If the sum is below ARB_THRESHOLD the buyer can lock in a risk-free profit
-    equal to (1.00 - total_cost) per dollar deployed — assuming both legs fill.
+    In a fair binary market UP_ask + DOWN_ask ≈ 1.00.
+    If the sum is below ARB_THRESHOLD the buyer locks in a risk-free profit
+    equal to (1.00 - total_cost) per dollar deployed.
 
     Returns an Opportunity dataclass if the condition is met, else None.
     """
-    total_cost = yes_ask + no_ask
+    total_cost = up_ask + down_ask
     if total_cost >= config.ARB_THRESHOLD:
         return None
 
-    edge = 1.0 - total_cost
-    edge_pct = edge * 100
+    edge_pct = (1.0 - total_cost) * 100
 
     return Opportunity(
         timestamp=timestamp,
-        market_id=market.get("condition_id") or market.get("market_slug") or "unknown",
-        market_title=market.get("question") or market.get("description") or "Unknown Market",
-        yes_ask=round(yes_ask, 4),
-        no_ask=round(no_ask, 4),
+        market_id=market.get("condition_id") or market.get("id") or "unknown",
+        market_title=market.get("question") or "Unknown Market",
+        yes_ask=round(up_ask, 4),
+        no_ask=round(down_ask, 4),
         total_cost=round(total_cost, 4),
         edge_pct=round(edge_pct, 4),
     )
@@ -326,39 +330,29 @@ async def scan_once(
 ) -> list[Opportunity]:
     """
     Scan every market in *markets* for arbitrage in a single pass.
-
-    Fetches order-book data concurrently (one coroutine per market) to
-    keep the full cycle well within SCAN_INTERVAL_SECONDS even for 50+ markets.
-
-    Returns the list of Opportunity objects found this cycle.
+    Fetches all order books concurrently for low latency.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     opportunities: list[Opportunity] = []
 
-    # Build one coroutine per market, then gather them all
-    async def _process_market(market: MarketDict) -> Opportunity | None:
+    async def _process(market: MarketDict) -> Opportunity | None:
         title = market.get("question") or "?"
         try:
-            yes_ask, no_ask = await _fetch_token_prices(session, market)
-
-            if yes_ask is None or no_ask is None:
-                # Missing price data — skip silently as per spec
+            up_ask, down_ask = await _fetch_token_prices(session, market)
+            if up_ask is None or down_ask is None:
                 return None
-
-            return _check_arb(market, yes_ask, no_ask, timestamp)
-
+            return _check_arb(market, up_ask, down_ask, timestamp)
         except Exception as exc:
-            # Never crash the main loop on a single market error
-            log_warning(f"Unexpected error processing '{title}': {exc}")
+            log_warning(f"Error processing '{title[:50]}': {exc}")
             return None
 
-    results = await asyncio.gather(*(_process_market(m) for m in markets))
+    results = await asyncio.gather(*(_process(m) for m in markets))
 
     for result in results:
         if result is not None:
             log_opportunity(result)
             opportunities.append(result)
-            # TODO: place_order() here — submit YES and NO legs to capture the edge
+            # TODO: place_order() here — submit UP and DOWN legs to capture the edge
 
     return opportunities
 
@@ -367,8 +361,10 @@ async def scan_once(
 
 async def load_and_filter_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Fetch all active markets and apply filters.
-    Called once at startup (and could be called periodically to catch new markets).
+    Fetch and filter markets from the Gamma API.
+
+    Called at startup AND on every scan cycle because 5-min/15-min markets
+    roll over continuously — each new window has new token IDs.
     """
     all_markets = await fetch_all_markets(session)
     return filter_markets(all_markets)

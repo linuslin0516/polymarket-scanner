@@ -54,23 +54,25 @@ async def run() -> None:
         markets = await scanner.load_and_filter_markets(session)
 
         if not markets:
-            log_error(
-                "No matching markets found.  Check your keyword filters "
-                "or increase SCAN_INTERVAL_SECONDS and try again."
-            )
-            return
+            log_error("No markets found on first load — will keep retrying every scan interval.")
 
-        log_info(f"Watching {len(markets)} markets.  Starting scan loop…\n")
+        log_info(f"Starting scan loop ({len(markets)} markets on first load)…\n")
 
         # ── Continuous scan loop ───────────────────────────────────────────
         while True:
             cycle_start = time.monotonic()
 
+            # Reload markets every cycle: 5-min/15-min markets roll over
+            # continuously with new condition_ids and token IDs.
+            try:
+                markets = await scanner.load_and_filter_markets(session)
+            except Exception as exc:
+                log_error(f"Market reload failed: {exc} — reusing previous list")
+
             # Run one full scan pass
             try:
-                found = await scanner.scan_once(session, markets)
+                found = await scanner.scan_once(session, markets) if markets else []
             except Exception as exc:
-                # Safeguard: the main loop must never crash
                 log_error(f"Unexpected error in scan cycle: {exc}")
                 found = []
 
