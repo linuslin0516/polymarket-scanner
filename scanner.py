@@ -63,31 +63,43 @@ async def _get_json(
     return None
 
 
+import base64 as _base64
+
+
+def _offset_cursor(offset: int) -> str:
+    """Encode an integer offset as a Polymarket pagination cursor (base64)."""
+    return _base64.b64encode(str(offset).encode()).decode()
+
+
 async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Retrieve active markets from the Polymarket CLOB API.
+    Retrieve the MOST RECENT markets from the Polymarket CLOB API.
 
-    Key design decisions:
-    - active=true  filters out expired/resolved markets server-side,
-      cutting the result set from 28,000+ down to ~200-500
-    - Sequential pagination (no concurrent fetches) keeps ordering clean
-    - MAX_PAGES = 10 is a safety cap; active markets fit in far fewer pages
+    The API returns markets oldest-first.  The 5-min/15-min crypto markets
+    were launched recently and live near the END of the ~28,000-market list.
+    Fetching from offset 0 and capping at 10 pages misses them entirely.
+
+    Strategy: start at a high offset (e.g. 26,000) and page forward to the
+    end of the list, collecting only the newest markets.  We then apply a
+    date filter so only currently-open markets are passed to the scanner.
     """
-    MAX_PAGES = 10
+    # Determined empirically: total market count is ~28,000.
+    # Start 3,000 from the end so we always catch the latest markets even
+    # as new ones are added daily.  Adjust START_OFFSET upward if needed.
+    START_OFFSET = 25_000
+    MAX_PAGES = 10   # 10 × 1,000 = up to 10,000 markets from that point
+
     markets: list[MarketDict] = []
-    cursor: str | None = None  # None = first page, no cursor param needed
+    cursor: str = _offset_cursor(START_OFFSET)
     page = 0
 
     while page < MAX_PAGES:
-        # Always filter for active markets — avoids pulling 28k+ historical entries
-        params: dict[str, str] = {"active": "true"}
-        if cursor:
-            params["next_cursor"] = cursor
+        params: dict[str, str] = {"next_cursor": cursor}
 
-        log_info(f"Fetching markets page {page + 1}" + (f" (cursor={cursor[:12]}…)" if cursor else " (first page)"))
+        log_info(f"Fetching markets page {page + 1} (offset ~{START_OFFSET + page * 1000})")
         data = await _get_json(session, f"{config.POLYMARKET_API_URL}/markets", params=params)
         if data is None:
-            break  # network failure already logged
+            break
 
         batch: list[MarketDict] = data.get("data", [])
         markets.extend(batch)
@@ -96,13 +108,12 @@ async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
         next_cursor: str = data.get("next_cursor", "") or ""
         log_info(f"  → got {len(batch)} markets (total so far: {len(markets)}), next_cursor={next_cursor[:16]!r}")
 
-        # Empty string or "LTE=" = end of data
         if not next_cursor or next_cursor == "LTE=" or len(batch) == 0:
             break
 
         cursor = next_cursor
 
-    log_info(f"Fetched {len(markets)} active markets across {page} page(s).")
+    log_info(f"Fetched {len(markets)} recent markets across {page} page(s).")
     return markets
 
 
