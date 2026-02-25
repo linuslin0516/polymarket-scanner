@@ -138,6 +138,13 @@ def _has_sufficient_liquidity(market: MarketDict) -> bool:
 
 def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
     """Apply keyword and liquidity filters; return the qualifying subset."""
+    # Debug: print a sample of raw market titles so we can tune keywords
+    log_info(f"--- Sample of first 20 active market titles (for keyword tuning) ---")
+    for m in markets[:20]:
+        title = m.get("question") or m.get("description") or "(no title)"
+        log_info(f"  SAMPLE | {title}")
+    log_info(f"--- End sample ---")
+
     filtered = [
         m for m in markets
         if m.get("active", False)
