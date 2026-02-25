@@ -160,32 +160,48 @@ def _has_sufficient_liquidity(market: MarketDict) -> bool:
         return False
 
 
+def _is_tradeable(market: MarketDict) -> bool:
+    """
+    Return True only if the market is fully live:
+      - active flag is True
+      - accepting_orders is True
+      - both YES and NO tokens have non-empty token_id
+    The date filter kept 1,198 zombie markets with active=False and
+    empty token IDs; this guard removes them.
+    """
+    if not market.get("active"):
+        return False
+    if not market.get("accepting_orders"):
+        return False
+    tokens: list[dict] = market.get("tokens", [])
+    if len(tokens) < 2:
+        return False
+    return all(bool(t.get("token_id")) for t in tokens)
+
+
 def filter_markets(markets: list[MarketDict]) -> list[MarketDict]:
-    """Apply date, keyword, and liquidity filters; return the qualifying subset."""
-    # Step 1: only future/active markets (replaces broken active=true API param)
-    future = [m for m in markets if _is_future_market(m)]
-    log_info(f"After date filter: {len(future)} markets still open (from {len(markets)} total)")
+    """Apply active/tradeable, keyword, and liquidity filters."""
+    # Step 1: keep only fully live, tradeable markets
+    tradeable = [m for m in markets if _is_tradeable(m)]
+    log_info(f"Tradeable markets: {len(tradeable)} (from {len(markets)} fetched)")
 
-    # Debug: dump every field of one market so we can see the actual data shape
-    if future:
-        sample = future[0]
-        log_info("=== FULL RAW MARKET OBJECT (first future market) ===")
-        for k, v in sample.items():
-            log_info(f"  {k}: {str(v)[:120]}")
-        log_info("=== END RAW MARKET OBJECT ===")
+    # Debug: show a few tradeable market titles to verify we're in the right range
+    log_info("--- Sample of 5 tradeable market titles ---")
+    for m in tradeable[:5]:
+        log_info(f"  SAMPLE | {m.get('question', '?')[:100]}")
+    log_info("--- End sample ---")
 
-    # Step 2: asset keyword match (BTC / ETH etc.)
+    # Step 2: keyword match + liquidity
     filtered = [
-        m for m in future
+        m for m in tradeable
         if _matches_keywords(m)
         and _has_sufficient_liquidity(m)
     ]
 
-    # On startup, log all matched markets so operator can verify filtering
     log_info(f"--- Matched {len(filtered)} Up/Down crypto markets ---")
     for m in filtered:
-        title = m.get("question") or m.get("description") or "(no title)"
-        end   = (m.get("end_date_iso") or m.get("end_date") or "?")[:16]
+        title = m.get("question") or "(no title)"
+        end   = (m.get("end_date_iso") or "?")[:16]
         liq   = float(m.get("liquidity") or 0)
         log_info(f"  WATCH | [{end}] ${liq:,.0f} | {title}")
     log_info(f"--- End market list ---")
