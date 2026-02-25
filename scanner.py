@@ -2,30 +2,31 @@
 scanner.py - Core arbitrage detection logic (READ-ONLY).
 
 Flow per scan cycle:
-  1. Query Polymarket Gamma API for live Up/Down crypto markets by keyword
-  2. For each market, fetch the best ask for the UP (yes) and DOWN (no) tokens
-     from the CLOB order-book endpoint
-  3. Compute total_cost = up_ask + down_ask
-  4. If total_cost < ARB_THRESHOLD emit an Opportunity via the logger
+  1. Generate Gamma API slugs for current/upcoming 15-min and 5-min windows
+  2. Fetch each slug concurrently to discover active Up/Down markets
+  3. For each market, fetch the best ask for UP and DOWN tokens from CLOB /book
+  4. Compute total_cost = up_ask + down_ask
+  5. If total_cost < ARB_THRESHOLD emit an Opportunity via the logger
 
-Why Gamma API for discovery, CLOB API for prices:
-  - The CLOB /markets endpoint returns 35,000+ markets without useful filtering.
-    The 5-min/15-min crypto markets are buried somewhere in that list.
-  - The Gamma API (used by the Polymarket frontend) supports keyword search and
-    returns fully-populated market objects including token IDs.
-  - The CLOB /book endpoint is still the correct source for live order-book data.
+Why slug-based discovery:
+  - The Gamma API's tag/search parameters don't reliably surface these markets.
+    tag_slug=crypto returns unrelated markets; q= is fuzzy/semantic.
+  - These markets have a deterministic slug format:
+      {crypto}-updown-{interval}-{unix_start_timestamp}
+    e.g.  btc-updown-15m-1740441600
+  - We compute the current and next N window start times, build the slugs, and
+    fetch them directly — no guessing, no filtering through 500 unrelated items.
 
 Why reload markets every cycle:
-  - 5-min and 15-min markets roll over continuously. Each new time window is a
-    completely new market with new condition_id and token IDs. Caching the list
-    at startup means we'd be querying stale/expired markets within minutes.
+  - 5-min and 15-min markets roll over continuously. Each new window is a
+    completely new market with new condition_id and token IDs.
 
 No order placement takes place here. Every spot where execution would happen
 is marked with:  # TODO: place_order() here
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import aiohttp
@@ -46,6 +47,11 @@ MarketDict = dict[str, Any]
 
 # Gamma API base URL (market discovery)
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
+
+# Cryptos that have Up/Down markets on Polymarket
+_CRYPTOS_15M = ["btc", "eth", "sol", "xrp"]
+_CRYPTOS_5M  = ["btc", "eth"]          # 5-min only available for BTC and ETH
+_WINDOW_LOOKAHEAD = 2                  # current window + 2 upcoming windows
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
@@ -84,51 +90,81 @@ async def _get_json(
     return None
 
 
-# ── Market discovery via Gamma API ────────────────────────────────────────────
+# ── Market discovery via slug generation ──────────────────────────────────────
 
-async def fetch_all_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
+def _get_window_timestamps(interval_minutes: int) -> list[int]:
     """
-    Fetch active markets from the Gamma API and filter by keyword client-side.
+    Return UTC unix timestamps for the current window and the next
+    _WINDOW_LOOKAHEAD windows of the given interval.
 
-    Why no tag_slug:
-      tag_slug=crypto returns unrelated markets (Trump deportation, GTA 6 price,
-      etc.) — apparently that tag is broader than expected.  Fetching a large
-      batch of all active markets and matching by title text is more reliable.
-
-    Why limit=500:
-      The Up/Down 5-min and 15-min markets roll over every few minutes, so they
-      are always among the most recently active markets.  A batch of 500 active
-      markets ordered by default (recency) reliably includes all open windows.
+    Example for interval_minutes=15 at 14:37 UTC:
+      → [1740441600 (14:30), 1740442500 (14:45), 1740443400 (15:00)]
     """
-    log_info("Fetching active markets from Gamma API (no tag filter)…")
+    now = datetime.now(timezone.utc)
+    floored_minute = (now.minute // interval_minutes) * interval_minutes
+    current = now.replace(minute=floored_minute, second=0, microsecond=0)
+    return [
+        int((current + timedelta(minutes=interval_minutes * i)).timestamp())
+        for i in range(_WINDOW_LOOKAHEAD + 1)
+    ]
+
+
+async def _fetch_market_by_slug(
+    session: aiohttp.ClientSession,
+    slug: str,
+) -> MarketDict | None:
+    """
+    Fetch a specific market by its Gamma API slug.
+    Returns the market dict if found and active, else None.
+    """
     data = await _get_json(
         session,
         f"{GAMMA_API_URL}/markets",
-        params={
-            "active": "true",
-            "closed": "false",
-            "limit":  "500",
-        },
+        params={"slug": slug},
     )
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
 
-    if data is None:
-        return []
 
-    raw: list[MarketDict] = data if isinstance(data, list) else data.get("data", [])
-    log_info(f"Gamma API returned {len(raw)} active markets (before keyword filter).")
+async def discover_updown_markets(
+    session: aiohttp.ClientSession,
+) -> list[MarketDict]:
+    """
+    Find all currently active Up/Down markets by constructing slugs for the
+    current and next _WINDOW_LOOKAHEAD time windows.
 
-    # Debug: show first 5 raw titles so we can verify ordering/content
-    for m in raw[:5]:
-        log_info(f"  RAW | {m.get('question','?')[:80]}")
+    Slug format:
+      {crypto}-updown-15m-{unix_start_timestamp}   e.g. btc-updown-15m-1740441600
+      {crypto}-updown-5m-{unix_start_timestamp}    e.g. eth-updown-5m-1740441900
 
-    # Client-side keyword filter — exact substring match on question title
-    matched = [
-        m for m in raw
-        if any(kw.lower() in (m.get("question") or "").lower()
-               for kw in config.MARKET_KEYWORDS)
-    ]
-    log_info(f"After keyword filter: {len(matched)} Up/Down markets.")
-    return matched
+    All slug fetches are run concurrently for low latency.
+    """
+    # Build (slug, label) pairs for all windows and cryptos
+    slugs: list[tuple[str, str]] = []
+    for ts in _get_window_timestamps(15):
+        for crypto in _CRYPTOS_15M:
+            slugs.append((f"{crypto}-updown-15m-{ts}", f"{crypto.upper()} 15m"))
+    for ts in _get_window_timestamps(5):
+        for crypto in _CRYPTOS_5M:
+            slugs.append((f"{crypto}-updown-5m-{ts}", f"{crypto.upper()} 5m"))
+
+    total = len(slugs)
+    log_info(f"Trying {total} slugs ({len(_CRYPTOS_15M)} cryptos × {_WINDOW_LOOKAHEAD+1} 15m windows"
+             f" + {len(_CRYPTOS_5M)} cryptos × {_WINDOW_LOOKAHEAD+1} 5m windows)…")
+
+    async def _try(slug: str, label: str) -> MarketDict | None:
+        log_info(f"  Trying slug: {slug}")
+        market = await _fetch_market_by_slug(session, slug)
+        if market and market.get("active"):
+            log_info(f"  Found {label} market: {slug}")
+            return market
+        return None
+
+    results = await asyncio.gather(*(_try(slug, label) for slug, label in slugs))
+    found = [m for m in results if m is not None]
+    log_info(f"Discovered {len(found)} active Up/Down markets.")
+    return found
 
 
 # ── Market normalisation ──────────────────────────────────────────────────────
@@ -214,8 +250,6 @@ async def _fetch_best_ask(
 
     Returns None if the book is empty or the request fails.
     """
-    # Debug: log the token_id being queried (first 20 chars)
-    log_info(f"    /book query token_id={token_id[:20]}…")
     data = await _get_json(
         session,
         f"{config.POLYMARKET_API_URL}/book",
@@ -350,10 +384,10 @@ async def scan_once(
 
 async def load_and_filter_markets(session: aiohttp.ClientSession) -> list[MarketDict]:
     """
-    Fetch and filter markets from the Gamma API.
+    Discover Up/Down markets by slug and normalise/validate them.
 
     Called at startup AND on every scan cycle because 5-min/15-min markets
     roll over continuously — each new window has new token IDs.
     """
-    all_markets = await fetch_all_markets(session)
+    all_markets = await discover_updown_markets(session)
     return filter_markets(all_markets)
